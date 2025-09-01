@@ -24,6 +24,10 @@ profile.cov
 go.work
 go.work.sum
 
+# Rust/Cargo generated files
+target/
+Cargo.lock
+
 # env file
 .env
 
