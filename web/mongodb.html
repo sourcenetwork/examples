@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+<meta charset="utf-8" />
+<title>MongoDB Client</title>
+<style>
+	body { font: 14px/1.35 system-ui, sans-serif; margin: 24px; max-width: 1100px; }
+	.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+	input, select, textarea, button { font: 13px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+	input, select, textarea { width: 100%; box-sizing: border-box; }
+	textarea { height: 160px; }
+	pre { background: #111; color: #eee; padding: 12px; border-radius: 6px; overflow: auto; }
+	label { font: 12px system-ui, sans-serif; opacity: .85; }
+	.row { margin: 10px 0; }
+	.op { margin-top: 8px; }
+	.muted { opacity: .65; font-size: 12px; }
+	.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<p><a href="/">home</a></p>
+<h1>MongoDB Client</h1>
+<p><small>POSTs JSON to <code>/mongodb</code>, which is fed to the local MongoDB instance via the official driver.</small></p>
+
+<div class="grid">
+	<div class="row">
+		<label>Examples</label>
+		<div class="grid" style="grid-template-columns: 2fr auto;">
+			<select id="examples"></select>
+			<button id="load">Load</button>
+		</div>
+	</div>
+</div>
+
+<hr>
+
+<div class="grid">
+	<div class="row">
+		<label>Database</label>
+		<input id="db" placeholder="i.e., myapp" />
+	</div>
+	<div class="row">
+		<label>Collection</label>
+		<input id="coll" placeholder="i.e., User" />
+	</div>
+</div>
+
+<div class="grid">
+	<div class="row">
+		<label>Operation</label>
+		<select id="op">
+			<option value="command">command</option>
+			<option value="find">find</option>
+			<option value="insertOne">insertOne</option>
+			<option value="updateOne">updateOne</option>
+			<option value="deleteOne">deleteOne</option>
+			<option value="aggregate">aggregate</option>
+			<option value="purge">drop (all dbs)</option>
+		</select>
+	</div>
+</div>
+
+<!-- find -->
+<div class="op" data-op="find">
+	<div class="grid">
+		<div class="row">
+			<label>Filter (JSON)</label>
+			<textarea data-name="filter" data-parse="json"></textarea>
+		</div>
+		<div class="row">
+			<label>Projection (JSON)</label>
+			<textarea data-name="projection" data-parse="json"></textarea>
+		</div>
+	</div>
+	<div class="grid">
+		<div class="row">
+			<label>Sort (JSON)</label>
+			<textarea data-name="sort" data-parse="json"></textarea>
+		</div>
+		<div class="row">
+			<label>Limit / Skip</label>
+			<div class="grid">
+				<input data-name="limit" data-parse="number" />
+				<input data-name="skip" data-parse="number" />
+			</div>
+		</div>
+	</div>
+</div>
+
+<!-- insertOne -->
+<div class="op" data-op="insertOne">
+	<div class="row">
+		<label>Document (JSON)</label>
+		<textarea data-name="doc" data-parse="json"></textarea>
+	</div>
+</div>
+
+<!-- updateOne -->
+<div class="op" data-op="updateOne">
+	<div class="grid">
+		<div class="row">
+			<label>Filter (JSON)</label>
+			<textarea data-name="filter" data-parse="json"></textarea>
+		</div>
+		<div class="row">
+			<label>Update (JSON)</label>
+			<textarea data-name="update" data-parse="json"></textarea>
+		</div>
+	</div>
+	<div class="row">
+		<label>Options (JSON) — e.g. <code>{"upsert": true}</code></label>
+		<textarea data-name="options" data-parse="json"></textarea>
+	</div>
+</div>
+
+<!-- deleteOne -->
+<div class="op" data-op="deleteOne">
+	<div class="row">
+		<label>Filter (JSON)</label>
+		<textarea data-name="filter" data-parse="json"></textarea>
+	</div>
+</div>
+
+<!-- aggregate -->
+<div class="op" data-op="aggregate">
+	<div class="row">
+		<label>Pipeline (JSON array)</label>
+		<textarea data-name="pipeline" data-parse="json"></textarea>
+	</div>
+	<div class="row">
+		<label>Options (JSON)</label>
+		<textarea data-name="options" data-parse="json"></textarea>
+	</div>
+</div>
+
+<!-- command -->
+<div class="op" data-op="command">
+	<div class="grid">
+		<div class="row">
+			<label>Command name</label>
+			<input data-name="command" data-parse="string" placeholder="ping" />
+			<p class="muted">Tip: name "ping" + body <code>{}</code> → runs <code>{ ping: 1 }</code>.</p>
+		</div>
+		<div class="row">
+			<label>Command body (JSON)</label>
+			<textarea data-name="commandBody" data-parse="json"></textarea>
+		</div>
+	</div>
+</div>
+
+<button id="run">Run</button>
+<pre id="out" class="hidden"></pre>
+
+<script>
+var $ = (id) => document.getElementById(id);
+var $$ = (q, root=document) => Array.from(root.querySelectorAll(q));
+var sections = $$(".op");
+
+function show(op) {
+	sections.forEach(s => s.classList.toggle("hidden",s.dataset.op != op));
+	$("db").closest(".grid").classList.toggle("hidden",op == "purge");
+	$("coll").closest(".row").classList.toggle("hidden",op == "command");
+}
+function parseField(el) {
+	var mode = el.dataset.parse || "string";
+	var val = el.value.trim();
+	if (val === "") return undefined;
+	if (mode === "number") return Number(val);
+	if (mode === "json")  { try { return JSON.parse(val); } catch (e) { throw new Error(`JSON error: ${e.message}`); } }
+	return val;
+}
+function collect(op) {
+	var body = {
+		op,
+		db: $("db").value.trim(),
+		coll: $("coll").value.trim(),
+	};
+	$$(".op:not(.hidden) [data-name]").forEach(el => {
+		var key = el.dataset.name;
+		var v = parseField(el);
+		if (v !== undefined) body[key] = v;
+	});
+	// prune empty db/coll when using command (server defaults to admin)
+	if (op === "command" && !body.db) delete body.db, delete body.coll;
+	return body;
+}
+var PRESETS = [
+	{
+		id: "command",
+		label: "⚙️ Manual Command",
+		command: "ping",
+		commandBody: {},
+	},
+	{
+		id: "find",
+		label: "🔍 Find User",
+		filter: {},
+		projection: { _id: 0, },
+		sort: { _id: -1, },
+		limit: 5,
+		skip: 0,
+	},
+	{
+		id: "insertOne",
+		label: "➕ Create User",
+		doc: () => ({
+			name: "Ada",
+			email: "ada@example.com",
+			counter: 1,
+			createdAt: new Date().toISOString(),
+		}),
+	},
+	{
+		id: "updateOne",
+		label: "✏️ Update User",
+		filter: { email: "ada@example.com", },
+		update: () => ({
+			$set: { name: "Ada Lovelace", },
+			$inc: { counter: 1, },
+			$setOnInsert: { createdAt: new Date().toISOString(), },
+		}),
+		options: { upsert: true, },
+	},
+	{
+		id: "deleteOne",
+		label: "🗑️ Delete User",
+		filter: { email: "ada@example.com", },
+	},
+	{
+		id: "aggregate",
+		label: "🧮 Aggregate Users",
+		pipeline: [ { $match: {}, }, { $limit: 5, }, ],
+		options: {},
+	},
+	{
+		id: "purge",
+		label: "⚠ Purge: Drop All DBs",
+	},
+];
+
+var opSel = $("op");
+opSel.addEventListener("change", () => {
+	show(opSel.value);
+	$("out").classList.remove("hidden");
+	$("out").textContent = "{}";
+});
+
+$("load").addEventListener("click",() => {
+	var p = PRESETS.find(x => x.id === $("examples").value);
+	if (!p) return;
+
+	opSel.value = p.id;
+	show(opSel.value);
+
+	$("db").value = "myapp";
+	$("coll").value = "User";
+
+	// write preset values into visible fields
+	$$(".op:not(.hidden) [data-name]").forEach(el => {
+		var k = el.dataset.name;
+		var v = p[k];
+		if (typeof v == "function") {
+			v = v();
+		}
+		if (v == null) return;
+		if (el.tagName === "TEXTAREA" || el.type === "text") {
+			el.value = (
+				typeof v === "string" ?
+					v :
+					JSON.stringify(v,null,2)
+			);
+		}
+		else {
+			el.value = v;
+		}
+	});
+},false);
+
+$("run").onclick = async () => {
+	$("out").classList.remove("hidden");
+	$("out").textContent = "...running";
+
+	try {
+		let body = collect(opSel.value);
+		let rsp = await fetch(
+			"/mongodb",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(body),
+			}
+		);
+		let text = await rsp.text();
+		try {
+			text = JSON.stringify(JSON.parse(text),null,2);
+		}
+		catch (err) {}
+
+		$("out").textContent = text;
+	}
+	catch (err) {
+		$("out").textContent = String(err);
+	}
+};
+
+(function initExamples(){
+	let sel = $("examples");
+	PRESETS.forEach(p => {
+		let opt = document.createElement("option");
+		opt.value = p.id;
+		opt.textContent = p.label;
+		sel.appendChild(opt);
+	});
+	sel.value = PRESETS[0].id;
+	$("load").click();
+})();
+
+// init
+show(opSel.value);
+
+</script>
+</body>
+</html>
