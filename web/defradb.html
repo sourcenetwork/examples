@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+<meta charset="utf-8" />
+<title>DefraDB Client (GraphQL)</title>
+<style>
+	body { font: 14px/1.4 system-ui, sans-serif; margin: 24px; max-width: 1100px; }
+	.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+	input, textarea, select, button { font: 13px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+	input, textarea, select { width: 100%; box-sizing: border-box; }
+	textarea { height: 220px; }
+	pre { background: #111; color: #eee; padding: 12px; border-radius: 6px; overflow: auto; }
+	label { font: 12px system-ui, sans-serif; opacity: .8; }
+	.row { margin: 10px 0; }
+	small { opacity: .75; }
+	.hidden { display: none; }
+</style>
+</head>
+<body>
+<p><a href="/">home</a></p>
+<h1>DefraDB Client (GraphQL)</h1>
+<p><small>POSTs to <code>/defradb</code>, which is forwarded to the local DefraDB instance (via endpoints <code>/graphql</code>, <code>/schema</code>, <code>/purge</code>, etc).</small></p>
+
+<div class="grid">
+	<div class="row">
+		<label>Examples</label>
+		<div class="grid" style="grid-template-columns: 2fr auto;">
+			<select id="examples"></select>
+			<button id="load">Load</button>
+		</div>
+	</div>
+	<div class="row">
+		<p id="notes" style="background:#222;color:#ddd;padding:10px;border-radius:6px;overflow:auto;" class="hidden"></p>
+	</div>
+</div>
+
+<hr>
+
+<div class="grid">
+	<div class="row">
+		<label>Request Document</label>
+		<textarea id="reqdoc"></textarea>
+	</div>
+	<div class="row">
+		<label>Request Document Mode</label>
+		<select id="reqdocmode">
+			<option value="graphql">GraphQL Query</option>
+			<option value="schema">Schema DDL</option>
+			<option value="purge">Purge</option>
+		</select>
+
+		<br><br>
+
+		<label>Operation name to run (optional)</label>
+		<input id="opname" placeholder="(if request document includes multiple operations)..." />
+	</div>
+</div>
+
+<div class="grid">
+	<div class="row">
+		<label>Variables (JSON) — optional</label>
+		<textarea id="vars"></textarea>
+	</div>
+	<div class="row">
+		<label>Headers (JSON) — optional</label>
+		<textarea id="headers"></textarea>
+	</div>
+</div>
+
+<div class="grid">
+</div>
+<div class="grid">
+	<div class="row">
+		<label>&nbsp;</label>
+		<button id="run">Run</button>
+	</div>
+</div>
+
+<pre id="out" class="hidden"></pre>
+
+<script>
+var $ = (id) => document.getElementById(id);
+
+// --- Presets (edit to match your schema names) ---
+var PRESETS = [
+	{
+		id: "schema-introspection",
+		mode: "graphql",
+		label: "🗂️ Schema Introspection",
+		reqdoc: `query Introspection {
+  __schema { queryType { name } types { name } }
+}`,
+		notes: null,
+	},
+	{
+		id: "check-user-type",
+		mode: "graphql",
+		label: "🔎 Check: Does `User` type exist?",
+		reqdoc: `query UserType {
+  __type(name: "User") { name fields { name type { name ofType { name } } } }
+}`,
+		notes: "Run this first. If the check returns null, run the \"Setup: Add `User` type\" preset. Then rerun this check (should now show the fields).",
+	},
+	{
+		id: "setup-user-type",
+		mode: "schema",
+		label: "🛠️ Setup: Add `User` type",
+		reqdoc: `type User {
+  name: String
+  email: String @index(unique: true)
+  counter: Int @crdt(type: pcounter)
+  createdAt: String
+}`,
+		notes: "Run this only once at initial setup.",
+	},
+	{
+		id: "list-users",
+		mode: "graphql",
+		label: "👥 List Users (limit/order)",
+		reqdoc: `query ListUsers($limit:Int=5,$offset:Int=0){
+  User(limit:$limit, offset:$offset, order:{ createdAt: DESC }) {
+    _docID name email createdAt
+  }
+}`,
+		variables: { limit: 5, offset: 0 },
+		notes: "Requires a `User` type to exist.",
+	},
+	{
+		id: "find-user",
+		mode: "graphql",
+		label: "🔍 Find User",
+		reqdoc: `query FindUser($email:String!){
+  User(filter:{ email:{ _eq:$email } }) { _docID name email counter }
+}`,
+		variables: { email: "ada@example.com" },
+		notes: "Change the email to one that exists.",
+	},
+	{
+		id: "create-user-inline",
+		mode: "graphql",
+		label: "➕ Create User (inline)",
+		reqdoc: () => `mutation CreateUser {
+  create_User(input:{ name:"Ada", email:"ada@example.com", counter:1, createdAt:"${new Date().toISOString()}" }) {
+    _docID name email counter createdAt
+  }
+}`,
+		notes: "DefraDB create mutations take an inline `input` object. No named `UserInput` type is required.",
+	},
+	{
+		id: "create-user-parameters",
+		mode: "graphql",
+		label: "➕ Create User (parameters)",
+		reqdoc: `mutation CreateUser($name:String!,$email:String!,$createdAt:String!,$counterInit:Int=1) {
+  create_User(input:{ name:$name, email:$email, counter:$counterInit, createdAt:$createdAt }) {
+    _docID name email counter createdAt
+  }
+}`,
+		variables: () => ({
+			name: "Ada",
+			email: "ada@example.com",
+			counterInit: 1,
+			createdAt: new Date().toISOString(),
+		}),
+		notes: "Create user with parameters.",
+	},
+	{
+		id: "update-user",
+		mode: "graphql",
+		label: "✏️ Update User",
+		reqdoc: `mutation UpdateUser($email:String!,$name:String!,$counterInc:Int=1){
+  update_User(
+    filter:{ email:{ _eq:$email } },
+    input:{ name:$name, counter:$counterInc }
+  ){ _docID name email counter }
+}`,
+		variables: {
+			name: "Ada Lovelace",
+			email: "ada@example.com",
+			counterInc: 1,
+		},
+		notes: "Filter determines which docs to update; `counter` is incremented by `counterInc` (default 1 if omitted) each update",
+	},
+	{
+		id: "delete-user",
+		mode: "graphql",
+		label: "🗑️ Delete User",
+		reqdoc: `mutation DeleteUser($email:String!){
+  delete_User(filter:{ email:{ _eq:$email } }){ _docID }
+}`,
+		variables: { email: "ada@example.com" },
+		notes: "Deletes all matching documents (often one, if email is unique).",
+	},
+	{
+		id: "multi-doc",
+		mode: "graphql",
+		label: "📄 Multiple operations",
+		operationName: "FindUser",
+		reqdoc: `query ListUsers {
+  User(limit:3){ _docID name }
+}
+
+query FindUser($email:String!){
+  User(filter:{ email:{ _eq:$email } }){ _docID name email counter }
+}`,
+		variables: { email: "ada@example.com" },
+		notes: "When a document has multiple operations, set the Operation Name input to the operation you want to run.",
+	},
+	{
+		id: "purge-db",
+		mode: "purge",
+		label: "⚠ Purge: Remove all data!",
+		notes: "BE CAREFUL! THIS CANNOT BE UNDONE!!",
+	},
+];
+
+$("load").addEventListener("click",() => {
+	$("notes").classList.add("hidden");
+
+	var p = PRESETS.find(x => x.id === $("examples").value);
+	if (!p) return;
+
+	$("reqdoc").value = (
+		p.reqdoc ? (
+			typeof p.reqdoc == "function" ?
+				p.reqdoc() :
+				p.reqdoc
+		) : ""
+	);
+	$("vars").value = (
+		p.variables ? JSON.stringify(
+			(
+				typeof p.variables == "function" ?
+					p.variables() :
+					p.variables
+			),
+			null,
+			2
+		) : ""
+	);
+	$("opname").value = p.operationName || "";
+	$("reqdocmode").value = p.mode || "graphql";
+	if (p.notes) {
+		$("notes").classList.remove("hidden");
+		$("notes").textContent = p.notes;
+	}
+},false);
+
+$("run").addEventListener("click",async () => {
+	$("out").classList.remove("hidden");
+	$("out").textContent = "...running";
+
+	var vars = {};
+	var hdrs = {};
+	try {
+		vars = JSON.parse($("vars").value || "{}");
+	}
+	catch (e) {
+		$("out").textContent = "Bad JSON in Variables: " + e;
+		return;
+	}
+	try {
+		hdrs = JSON.parse($("headers").value || "{}");
+	}
+	catch (e) {
+		$("out").textContent = "Bad JSON in Headers: " + e;
+		return;
+	}
+
+	var payload = {
+		...(
+			$("reqdocmode").value == "graphql" ?
+				{ query: $("reqdoc").value, } :
+
+			$("reqdocmode").value == "schema" ?
+				{ schema: $("reqdoc").value, } :
+
+				{ [$("reqdocmode").value]: 1, }
+		),
+		...(
+			Object.keys(vars).length > 0 ?
+				{ variables: vars, } :
+
+			null
+		),
+	};
+	var opn = $("opname").value.trim();
+	if (opn) payload.operationName = opn;
+
+	try {
+		let rsp = await fetch("/defradb", {
+			method: "POST",
+			headers: Object.assign(
+				{
+					"Content-Type": "application/json",
+				},
+				hdrs
+			),
+			body: JSON.stringify(payload)
+		});
+		let text = await rsp.text();
+		try {
+			$("out").textContent = JSON.stringify(JSON.parse(text),null,2);
+		}
+		catch {
+			$("out").textContent = text;
+		}
+	}
+	catch (err) {
+		$("out").textContent = "Request error: " + err;
+	}
+},false);
+
+(function initExamples(){
+	let sel = $("examples");
+	PRESETS.forEach(p => {
+		let opt = document.createElement("option");
+		opt.value = p.id;
+		opt.textContent = p.label;
+		sel.appendChild(opt);
+	});
+	sel.value = PRESETS[0].id;
+	$("load").click();
+})();
+</script>
+</body>
+</html>
