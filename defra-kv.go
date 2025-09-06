@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -81,17 +80,17 @@ func ensureKV(ctx context.Context, n *dnode.Node) error {
 }
 
 func main() {
-	// ---- Custom FlagSet (avoid random flags from transitive deps) ----
+	// Define Custom FlagSet
 	fs := flag.NewFlagSet("defra-kv", flag.ExitOnError)
-	rootdir := fs.String("rootdir", defaultRootdir(), "data/config directory (default: ./.defra-kv)")
-	secret  := fs.String("keyring-secret", "", "keyring secret (or set DEFRA_KEYRING_SECRET)")
-	query   := fs.String("query", "", "GraphQL query/mutation; if empty, read from stdin")
-	varsStr := fs.String("vars", "", "JSON variables (optional)")
+	rootdir := fs.String("rootdir", defaultRootdir(), "data/config directory")
+	secret  := fs.String("keyring-secret", "", "keyring secret (sets DEFRA_KEYRING_SECRET)")
+	query   := fs.String("query", "", "GraphQL query/mutation")
+	varsStr := fs.String("vars", "", "JSON variables")
 	pretty  := fs.Bool("pretty", true, "pretty-print JSON")
 	reqTO   := fs.Duration("timeout", 10*time.Second, "per-request timeout")
 	_ = fs.Parse(os.Args[1:])
 
-	// Keyring secret (first run convenience).
+	// Process keyring secret
 	if *secret != "" {
 		_ = os.Setenv("DEFRA_KEYRING_SECRET", *secret)
 	}
@@ -109,21 +108,27 @@ func main() {
 		q = strings.TrimSpace(string(b))
 	}
 	if q == "" {
-		fmt.Fprintln(os.Stderr, "no query provided; pass --query or pipe to stdin")
+		fmt.Fprintln(os.Stderr, "no query provided; pass -query or pipe to stdin")
 		os.Exit(2)
 	}
 
-	// Variables (optional, parsed later).
-	var rawVars json.RawMessage
+	// Parse user-provided variables (if any)
+	var vars map[string]any
 	if v := strings.TrimSpace(*varsStr); v != "" {
-		rawVars = json.RawMessage(v)
+		var rawVars json.RawMessage = json.RawMessage(v)
+
+		if len(rawVars) > 0 {
+			if err := json.Unmarshal(rawVars, &vars); err != nil {
+				log.Fatalf("parse -vars: %v", err)
+			}
+		}
 	}
 
-	// Context + signals.
+	// Initialize context and signals
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// --- 1) Create the node (embedded, persistent Badger) ---
+	// Create and start the node (embedded, persistent Badger)
 	n, err := dnode.New(
 		ctx,
 		dnode.WithDisableAPI(true),                    // no HTTP server
@@ -134,29 +139,24 @@ func main() {
 		dnode.WithLensRuntime(dnode.Wazero),           // pure-Go WASM runtime
 	)
 	if err != nil {
-		log.Fatalf("node.New: %v", err)
+		log.Fatalf("dnode.New: %v", err)
 	}
+
 	defer func() { _ = n.Close(ctx) }()
 	if err := n.Start(ctx); err != nil {
 		log.Fatalf("node.Start: %v", err)
 	}
 
-	// --- 2) Ensure KV schema (idempotent) ---
+	// Ensure KV schema (idempotent)
 	if err := ensureKV(ctx, n); err != nil {
 		log.Fatalf("ensure KV schema: %v", err)
 	}
 
-	// --- 3) Execute the user’s GraphQL directly in-process ---
-	var vars map[string]any
-	if len(rawVars) > 0 {
-		if err := json.Unmarshal(rawVars, &vars); err != nil {
-			log.Fatalf("parse -vars: %v", err)
-		}
-	}
-
+	// Setup timeout handler
 	reqCtx, cancel := context.WithTimeout(ctx, *reqTO)
 	defer cancel()
 
+	// Execute GraphQL query directly in-process
 	res := n.DB.ExecRequest(reqCtx, q, dclient.WithVariables(vars))
 	if len(res.GQL.Errors) > 0 {
 		enc, _ := json.MarshalIndent(res.GQL.Errors, "", "  ")
@@ -164,7 +164,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Output JSON (pretty or compact).
+	// Output JSON (pretty or compact)
 	if *pretty {
 		out, _ := json.MarshalIndent(map[string]any{"data": res.GQL.Data}, "", "  ")
 		fmt.Println(string(out))
