@@ -17,6 +17,7 @@ import (
 
 	dclient "github.com/sourcenetwork/defradb/client"
 	dnode   "github.com/sourcenetwork/defradb/node"
+	"github.com/rs/zerolog"
 )
 
 func defaultRootdir() string {
@@ -79,18 +80,76 @@ func ensureKV(ctx context.Context, n *dnode.Node) error {
 	return nil
 }
 
+type fdSilencer struct {
+	muted         bool
+	devnull       *os.File
+	origStdout    *os.File
+	origStderr    *os.File
+	origLogWriter io.Writer
+}
+
+func (s *fdSilencer) Mute() {
+	if s.muted {
+		return
+	}
+	dn, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	s.devnull = dn
+	s.origStdout = os.Stdout
+	s.origStderr = os.Stderr
+	s.origLogWriter = log.Writer()
+
+	// redirect global stdio and stdlib logger
+	os.Stdout = dn
+	os.Stderr = dn
+	log.SetOutput(dn)
+
+	s.muted = true
+}
+
+func (s *fdSilencer) PrintlnOut(line string) {
+	if s != nil && s.origStdout != nil {
+		_, _ = s.origStdout.Write([]byte(line))
+		_, _ = s.origStdout.Write([]byte("\n"))
+		return
+	}
+	_, _ = os.Stdout.Write([]byte(line + "\n"))
+}
+
+func (s *fdSilencer) PrintlnErr(line string) {
+	if s != nil && s.origStderr != nil {
+		_, _ = s.origStderr.Write([]byte(line))
+		_, _ = s.origStderr.Write([]byte("\n"))
+		return
+	}
+	_, _ = os.Stderr.Write([]byte(line + "\n"))
+}
+
+func die(s *fdSilencer, format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	if s != nil {
+		s.PrintlnErr(msg)
+	} else {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+	os.Exit(1)
+}
+
 func main() {
-	// Define Custom FlagSet
+	// Flags
 	fs := flag.NewFlagSet("defra-kv", flag.ExitOnError)
-	rootdir := fs.String("rootdir", defaultRootdir(), "data/config directory")
-	secret  := fs.String("keyring-secret", "", "keyring secret (sets DEFRA_KEYRING_SECRET)")
+	rootdir := fs.String("rootdir", defaultRootdir(), "Data/config directory")
+	secret  := fs.String("keyring-secret", "", "Keyring secret (sets DEFRA_KEYRING_SECRET)")
 	query   := fs.String("query", "", "GraphQL query/mutation")
 	varsStr := fs.String("vars", "", "JSON variables")
-	pretty  := fs.Bool("pretty", true, "pretty-print JSON")
-	reqTO   := fs.Duration("timeout", 10*time.Second, "per-request timeout")
+	pretty  := fs.Bool("pretty", true, "Pretty-print JSON output")
+	reqTO   := fs.Duration("timeout", 10*time.Second, "Request timeout")
+	devMode := fs.Bool("dev", false, "enable development mode and verbose logging")
 	_ = fs.Parse(os.Args[1:])
 
-	// Process keyring secret
+	// Keyring secret (first run convenience)
 	if *secret != "" {
 		_ = os.Setenv("DEFRA_KEYRING_SECRET", *secret)
 	}
@@ -98,7 +157,7 @@ func main() {
 		_ = os.Setenv("DEFRA_KEYRING_SECRET", "dev-dev-dev")
 	}
 
-	// Read query (flag or stdin).
+	// Read query (flag or stdin)
 	q := strings.TrimSpace(*query)
 	if q == "" {
 		b, err := io.ReadAll(os.Stdin)
@@ -108,25 +167,39 @@ func main() {
 		q = strings.TrimSpace(string(b))
 	}
 	if q == "" {
-		fmt.Fprintln(os.Stderr, "no query provided; pass -query or pipe to stdin")
+		fmt.Fprintln(os.Stderr, "no query provided; pass --query or pipe to stdin")
 		os.Exit(2)
 	}
 
-	// Parse user-provided variables (if any)
+	// Variables (optional)
 	var vars map[string]any
 	if v := strings.TrimSpace(*varsStr); v != "" {
-		var rawVars json.RawMessage = json.RawMessage(v)
-
-		if len(rawVars) > 0 {
-			if err := json.Unmarshal(rawVars, &vars); err != nil {
-				log.Fatalf("parse -vars: %v", err)
-			}
+		if err := json.Unmarshal([]byte(v), &vars); err != nil {
+			log.Fatalf("parse -vars: %v", err)
 		}
 	}
 
-	// Initialize context and signals
+	// Context + signals
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Configure logging based on dev mode
+	var sil fdSilencer
+	if !*devMode {
+		// Environment-driven loggers used by Defra & deps
+		_ = os.Setenv("DEFRA_LOG_LEVEL", "error")
+		_ = os.Setenv("CORELOG_LEVEL", "error") // if corelog is present
+		_ = os.Setenv("GOLOG_LOG_LEVEL", "error")
+
+		// zerolog global level
+		zerolog.SetGlobalLevel(zerolog.Disabled)
+
+		// mute stdio
+		sil.Mute()
+	} else {
+		// allow all logs through
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
 
 	// Create and start the node (embedded, persistent Badger)
 	n, err := dnode.New(
@@ -137,39 +210,52 @@ func main() {
 		dnode.WithStoreType(dnode.BadgerStore),
 		dnode.WithStorePath(resolveRootdir(*rootdir)), // data dir
 		dnode.WithLensRuntime(dnode.Wazero),           // pure-Go WASM runtime
+		dnode.WithEnableDevelopment(*devMode),         // toggle dev features/logging
 	)
 	if err != nil {
-		log.Fatalf("dnode.New: %v", err)
+		die(&sil, "dnode.New: %v", err)
 	}
+	defer func() {
+		_ = n.Close(ctx)
+	}()
 
-	defer func() { _ = n.Close(ctx) }()
 	if err := n.Start(ctx); err != nil {
-		log.Fatalf("node.Start: %v", err)
+		die(&sil, "n.Start: %v", err)
 	}
 
-	// Ensure KV schema (idempotent)
 	if err := ensureKV(ctx, n); err != nil {
-		log.Fatalf("ensure KV schema: %v", err)
+		die(&sil, "ensure KV schema: %v", err)
 	}
 
-	// Setup timeout handler
 	reqCtx, cancel := context.WithTimeout(ctx, *reqTO)
 	defer cancel()
 
-	// Execute GraphQL query directly in-process
 	res := n.DB.ExecRequest(reqCtx, q, dclient.WithVariables(vars))
+
+	// Close the node explicitly
+	_ = n.Close(ctx)
+
+	// Output GraphQL errors as reported (if any)
 	if len(res.GQL.Errors) > 0 {
 		enc, _ := json.MarshalIndent(res.GQL.Errors, "", "  ")
-		fmt.Fprintln(os.Stderr, string(enc))
+		if !*devMode {
+			sil.PrintlnErr(string(enc))
+		} else {
+			fmt.Fprintln(os.Stderr, string(enc))
+		}
 		os.Exit(1)
 	}
 
-	// Output JSON (pretty or compact)
+	// Output JSON (with pretty-printing if specified)
+	var outBytes []byte
 	if *pretty {
-		out, _ := json.MarshalIndent(map[string]any{"data": res.GQL.Data}, "", "  ")
-		fmt.Println(string(out))
+		outBytes, _ = json.MarshalIndent(map[string]any{"data": res.GQL.Data}, "", "  ")
 	} else {
-		out, _ := json.Marshal(map[string]any{"data": res.GQL.Data})
-		fmt.Println(string(out))
+		outBytes, _ = json.Marshal(map[string]any{"data": res.GQL.Data})
+	}
+	if !*devMode {
+		sil.PrintlnOut(string(outBytes))
+	} else {
+		fmt.Println(string(outBytes))
 	}
 }
