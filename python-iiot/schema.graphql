@@ -1,0 +1,8 @@
+
+type SensorEvent {
+    deviceId: String
+    timestamp: Float
+    prediction: String
+    probability: Float
+}
+

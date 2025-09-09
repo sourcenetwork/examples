@@ -24,9 +24,17 @@ profile.cov
 go.work
 go.work.sum
 
+# Python related files
+venv/
+
 # env file
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+# Ignore OS X metadata files.
+.history
+**.DS_Store
+**.DS_Code
